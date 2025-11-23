@@ -298,13 +298,20 @@
 
       async getEvents(date) {
         if (!Store.staffId) return [];
-        const midnight = "00:00:00";
         
+        // FIXED: Dynamic Timezone Calculation
+        // Construct a Local Date object for "Midnight" on the selected date
+        const [y, m, d] = date.split('-').map(Number);
+        const localMidnight = new Date(y, m - 1, d); 
+        // Get the ISO string which includes the correct UTC start time for that local midnight
+        // Example: 00:00 Local -> 07:00 UTC (if -7 offset)
+        const queryDate = localMidnight.toISOString();
+
         try {
           // Parallel fetch: Events & Available Times
           const [eventsRes, opensRes] = await Promise.all([
-            fetch(`${CONFIG.apiBase}/event_occurrences.json?from=${date}T${midnight}Z&staff_member_ids=${Store.staffId}`, { headers: this.getHeaders() }),
-            fetch(`${CONFIG.apiBase}/available_times.json?from=${date}T${midnight}Z`, { headers: this.getHeaders() })
+            fetch(`${CONFIG.apiBase}/event_occurrences.json?from=${queryDate}&staff_member_ids=${Store.staffId}`, { headers: this.getHeaders() }),
+            fetch(`${CONFIG.apiBase}/available_times.json?from=${queryDate}`, { headers: this.getHeaders() })
           ]);
 
           const eventsData = await eventsRes.json();
@@ -353,12 +360,9 @@
                     }
                 };
 
-                // Note: Using specific bearer for Reports if needed, otherwise fallback to standard
-                // The original code used a hardcoded specific token for this call. 
-                // Assuming standard token works or re-use existing if valid.
                 const reportRes = await fetch(CONFIG.reportApi, {
                     method: "POST",
-                    headers: { ...this.getHeaders(), "Authorization": "Bearer kZEbOpElCispz8mFkeoTsVGVCvSP23mZG82G7eeN" }, // Preserved specific token from original
+                    headers: { ...this.getHeaders(), "Authorization": "Bearer kZEbOpElCispz8mFkeoTsVGVCvSP23mZG82G7eeN" },
                     body: JSON.stringify(queryBody)
                 });
 
@@ -375,7 +379,7 @@
                             const levelStr = details[1] || "";
                             // Extract single letter level or first word char
                             item.level = /\d/.test(levelStr[6]) ? levelStr[6] : (levelStr.split(" ")[0]?.[0] || "?");
-                            item.isNew = !details[2]; // No first visit date = New? Or logic from original
+                            item.isNew = !details[2]; 
                             
                             if (details[3]) {
                                 const diff = Date.now() - new Date(details[3]);
@@ -409,9 +413,6 @@
             // 2. Apply new state (if not reset)
             const targetState = u.type === "Check In" ? "complete" : "noshow";
             
-            // Logic: If button says "Check In", it means current state is NOT checked in. 
-            // We want to send 'complete'.
-            
             await fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
                 method: "PUT", headers, body: JSON.stringify({ visit: { state_event: targetState } })
             });
@@ -419,7 +420,7 @@
             // 3. Punch if No Show
             if (targetState === "noshow") {
                 await fetch(`${CONFIG.apiBase}/punches`, {
-                    method: "POST", headers, body: JSON.stringify({ punch: { visit_visit_id: u.visitId } }) // Note: API usually wants visit_id
+                    method: "POST", headers, body: JSON.stringify({ punch: { visit_visit_id: u.visitId } }) 
                 });
             }
         }
