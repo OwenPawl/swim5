@@ -110,6 +110,7 @@
     .col-main { max-width: 50vw; overflow: hidden; }
     .name-text { font-weight: 800; color: var(--blue); display: block; }
     .sub-text { font-size: 0.9em; color: var(--muted); display: block; margin-top: 2px; }
+    
     /* Styling for internal slots (Note Time, Paid Break, Open) */
     .row-internal .name-text { color: var(--muted); font-style: italic; }
 
@@ -239,6 +240,7 @@
     const CONFIG = {
       clientId: "ixG6UsN5JaLPYFgwjhTAtmdg8UNU7IZYK2lOxTo3",
       // These client IDs are used for internal events like Note Time or Paid Breaks.
+      // 11485475: Note Time, 11559838: Paid Break (Examples)
       ignoredClientIds: [11485475, 11559838, 13602611, 13167161],
       apiBase: "https://mcdonaldswimschool.pike13.com/api/v2/desk",
       reportApi: "https://mcdonaldswimschool.pike13.com/desk/api/v3/reports/clients/queries"
@@ -298,6 +300,7 @@
       async getBasicEvents(date) {
         if (!Store.staffId) return [];
         
+        // Format date to Pike13's required ISO midnight format (T00:00:00Z)
         const [y, m, d] = date.split('-').map(Number);
         const localMidnight = new Date(y, m - 1, d); 
         const queryDate = localMidnight.toISOString();
@@ -320,22 +323,21 @@
                     const clientId = Number(p.id);
                     const isInternal = CONFIG.ignoredClientIds.includes(clientId);
 
+                    // Use event name as a placeholder before report enrichment
                     rawList.push({
                         id: p.id,
                         visitId: p.visit_id,
                         state: p.visit_state,
                         start: evt.start_at,
                         end: evt.end_at,
-                        // Use event name (e.g., "Note Time") for internal clients, person name for others
                         name: isInternal ? (evt.name || "Internal Slot") : p.name, 
-                        type: isInternal ? "internal_client" : "lesson", // New type for Note/Break time
-                        level: "...", 
+                        type: isInternal ? "internal_client" : "lesson", 
+                        level: "", 
                         isNew: false,
-                        age: "..."
+                        age: ""
                     });
                  });
              }
-             // No need for 'events without people' block based on user's clarification
           });
 
           // Process Opens (Available Times)
@@ -363,79 +365,115 @@
         }
       },
 
-      // STAGE 2: Fetch details for Clients (Report)
+      // STAGE 2: Fetch details for Clients and apply name fix
       async enrichWithReports(currentList) {
-         // Only look for actual client IDs (numeric) and exclude internal/ignored clients
+         // Get unique client IDs (numeric and not already marked as internal/open)
          const clientIds = currentList
-            .filter(x => x.type === 'lesson' && x.id && !isNaN(x.id) && !CONFIG.ignoredClientIds.includes(Number(x.id)))
+            .filter(x => x.id && !isNaN(x.id))
             .map(x => x.id);
 
          if (clientIds.length === 0) return currentList;
 
-         // Unique IDs only to save bandwidth
          const uniqueIds = [...new Set(clientIds)];
 
          try {
+            // Report Query payload
             const queryBody = {
                 data: {
                     type: "queries",
                     attributes: {
-                        fields: ["person_id", "custom_field_180098", "first_visit_date", "birthdate"],
+                        // Fields: [0: person_id, 1: person_name, 2: first_visit_date, 3: birthdate, 4: custom_field_180098(Level)]
+                        fields: ["person_id", "person_name", "first_visit_date", "birthdate", "custom_field_180098"],
                         filter: ["or", uniqueIds.map(id => ["eq", "person_id", String(id)])]
                     }
                 }
             };
-
+            
+            // NOTE: Using desk/api/v3 requires the specific authentication method, using the provided example key
             const reportRes = await fetch(CONFIG.reportApi, {
                 method: "POST",
                 headers: { ...this.getHeaders(), "Authorization": "Bearer kZEbOpElCispz8mFkeoTsVGVCvSP23mZG82G7eeN" },
                 body: JSON.stringify(queryBody)
             });
 
-            if (!reportRes.ok) return currentList;
+            if (!reportRes.ok) {
+                 console.error("Report fetch failed with status:", reportRes.status);
+                 return currentList; // Return unenriched data on error
+            }
 
             const reportJson = await reportRes.json();
             const rows = reportJson.data?.attributes?.rows || [];
             
             // Map details back to list
             return currentList.map(item => {
-                if (item.type !== 'lesson') return item;
+                if (item.type === 'open') return item;
                 
                 const details = rows.find(r => Number(r[0]) === Number(item.id));
                 if (details) {
-                    const levelStr = details[1] || "";
-                    item.level = /\d/.test(levelStr[6]) ? levelStr[6] : (levelStr.split(" ")[0]?.[0] || "?");
-                    item.isNew = !details[2]; 
+                    const clientId = Number(item.id);
+                    const isInternal = CONFIG.ignoredClientIds.includes(clientId);
                     
-                    if (details[3]) {
-                        const diff = Date.now() - new Date(details[3]);
-                        item.age = (Math.floor(diff / (31557600000)) * 10 / 10).toFixed(1); 
+                    // The client's actual name is at index 1 in the new report structure
+                    const realName = details[1]; 
+
+                    // 1. ALWAYS use the real name
+                    item.name = realName || item.name;
+                    item.type = isInternal ? "internal_client" : "lesson";
+                    
+                    if (isInternal) {
+                        // 2. For internal clients, suppress level/age/new status
+                        item.level = "";
+                        item.isNew = false;
+                        item.age = "";
+                    } else {
+                        // 3. For regular lessons, calculate and store details
+                        const levelStr = details[4] || ""; // custom_field_180098
+                        const firstVisit = details[2];
+                        const birthdate = details[3];
+
+                        item.level = /\d/.test(levelStr[6]) ? levelStr[6] : (levelStr.split(" ")[0]?.[0] || "?");
+                        item.isNew = !firstVisit; 
+                        
+                        if (birthdate) {
+                            const diff = Date.now() - new Date(birthdate);
+                            // Age in years, rounded to 1 decimal place
+                            item.age = (Math.floor(diff / (31557600000) * 10) / 10).toFixed(1); 
+                        }
                     }
                 }
                 return item;
             });
 
          } catch (e) {
-             console.error("Report fetch failed", e);
+             console.error("Report fetch failed:", e);
              return currentList;
          }
       },
 
       async updateAttendance(updates) {
         const headers = this.getHeaders();
-        for (const u of updates) {
-            await fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
+        // Use a Promise.allSettled to handle all updates concurrently and robustly
+        const results = await Promise.allSettled(updates.flatMap(u => {
+            const reset = fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
                 method: "PUT", headers, body: JSON.stringify({ visit: { state_event: "reset" } })
             });
             const targetState = u.type === "Check In" ? "complete" : "noshow";
-            await fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
+            const updateState = fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
                 method: "PUT", headers, body: JSON.stringify({ visit: { state_event: targetState } })
             });
+            let punch = Promise.resolve();
             if (targetState === "noshow") {
-                await fetch(`${CONFIG.apiBase}/punches`, {
+                // Pike13 expects a punch for No Show status
+                punch = fetch(`${CONFIG.apiBase}/punches`, {
                     method: "POST", headers, body: JSON.stringify({ punch: { visit_visit_id: u.visitId } }) 
                 });
             }
+            return [reset, updateState, punch];
+        }));
+
+        const failed = results.filter(r => r.status === 'rejected');
+        if (failed.length > 0) {
+            console.error("Some attendance submissions failed:", failed);
         }
       }
     };
@@ -443,9 +481,11 @@
     // --- Logic / Data Processor ---
     const Processor = {
         formatTime(isoString) {
+            // Formats to PST/PDT time (e.g., 9:00 AM)
             return new Date(isoString).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
         },
         
+        // Merges consecutive slots for the same client (or internal event)
         mergeBlocks(data) {
             if (!data || !data.length) return [];
             
@@ -462,10 +502,9 @@
                 }];
                 
                 let j = i + 1;
-                // Merge if same ID (person or internal event) AND consecutive times
+                // Merge if same ID AND consecutive times
                 while (j < data.length && 
                        data[j].id === current.id && 
-                       data[j].name === current.name &&
                        new Date(data[j].start).getTime() === new Date(current.end).getTime()) {
                     
                     current.end = data[j].end;
@@ -481,18 +520,21 @@
                 
                 // Formatting Name for Display
                 if (current.type === 'internal_client' || current.type === 'open') {
+                    // Use full name/title for internal slots
                     current.displayName = current.name;
-                    current.level = ""; // Clear level/age for internal slots
-                    current.age = "";
+                    current.displayLevel = "";
                 } else if (current.state === 'late_canceled' || current.state === 'canceled') {
-                    current.displayName = "CANCELED";
+                    current.displayName = `CANCELED: ${current.name}`;
                     current.displayLevel = "—";
                 } else {
+                    // Shorten client name (First Initial of Last Name)
                     const parts = current.name.trim().split(/\s+/);
                     const shortName = parts.length > 1 
-                        ? `${parts[0]} ${parts[parts.length-1][0]}` 
+                        ? `${parts[0]} ${parts[parts.length-1][0]}.` 
                         : parts[0];
+                    // Title-case the name
                     current.displayName = shortName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+                    current.displayLevel = current.level;
                 }
                 
                 const duration = (new Date(current.end) - new Date(current.start)) / 60000;
@@ -542,48 +584,44 @@
 
             // FILTER: Filter logic based on view
             if (Store.currentView === 'attendance') {
-                // Attendance view: Remove Opens (type=open), Note Time/Breaks (type=internal_client), and any remaining ignored IDs.
+                // Attendance view: Remove Opens and internal_client slots
+                dataToRender = dataToRender.filter(item => item.type === 'lesson');
+            } else {
+                // Schedule view: Remove canceled/late-canceled lessons
                 dataToRender = dataToRender.filter(item => 
-                    item.type === 'lesson' && // Only lessons
-                    !CONFIG.ignoredClientIds.includes(Number(item.id)) // Skip ignored IDs
+                   !(item.type === 'lesson' && (item.state === 'canceled' || item.state === 'late_canceled'))
                 );
             }
-
-            // Remove all ignored client lessons (they are internal slots that should only show if they are of type internal_client or open)
-            const validData = dataToRender.filter(d => 
-                d.type !== 'lesson' || !CONFIG.ignoredClientIds.includes(Number(d.id))
-            );
-
-            const processed = Processor.mergeBlocks(validData);
+            
+            const processed = Processor.mergeBlocks(dataToRender);
             
             if (processed.length === 0) {
-                this.els.table.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 30px; color: var(--muted);">No items found.</td></tr>';
+                this.els.table.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 30px; color: var(--muted);">No scheduled items found.</td></tr>';
                 return;
             }
 
-            const groups = Processor.groupByTime(processed);
-
             if (Store.currentView === 'schedule') {
-                this.renderSchedule(groups);
+                this.renderSchedule(processed);
             } else {
                 this.renderAttendance(processed); 
             }
         },
 
-        renderSchedule(groups) {
+        renderSchedule(items) {
             this.els.pageTitle.textContent = "Schedule";
+            const groups = Processor.groupByTime(items);
             let html = `<thead><tr><th class="col-time">Start</th><th class="col-dur">Min</th><th class="col-main">Student</th><th>Lvl</th><th>Age</th></tr></thead><tbody>`;
 
             groups.forEach(([startIso, items]) => {
                 const timeStr = Processor.formatTime(startIso).replace(/ AM| PM/,''); 
-                const duration = items[0].duration; // Use first duration in block
+                const duration = items[0].duration; 
                 
                 let nameHtml = items.map(i => {
                     let badge = i.isNew ? '<span class="badge-new">NEW</span>' : '';
                     return `<span class="name-text">${i.displayName} ${badge}</span>`;
                 }).join('<div style="height:8px"></div>'); 
 
-                let lvlHtml = items.map(i => i.level || '').join('<br>');
+                let lvlHtml = items.map(i => i.displayLevel || '').join('<br>');
                 let ageHtml = items.map(i => i.age || '').join('<br>');
                 
                 // Special styling for internal rows (Note Time, Paid Break, Open)
@@ -611,15 +649,18 @@
                 const firstState = item.visitors[0].state;
                 const color = firstState === 'noshowed' ? 'var(--red)' : (firstState === 'completed' ? 'var(--green)' : 'var(--blue)');
 
+                // Each visitor (if merged) gets their own button to submit attendance
                 let checkinButtons = item.visitors.map(v => {
                     const isNoShow = v.state === 'noshowed';
                     const isComplete = v.state === 'completed';
                     const btnClass = isNoShow ? 'status-noshow' : (isComplete ? 'status-completed' : 'status-registered');
-                    const btnText = isNoShow || isComplete ? (isNoShow ? 'No Show' : 'Completed') : 'Check In';
+                    const btnText = isNoShow || isComplete ? (isNoShow ? 'No Show' : 'Check In') : 'Check In'; // Initial state is 'Check In' for registered/unmarked
+                    const currentState = v.state; // registered, completed, noshowed
 
                     return `<button class="check-in-btn ${btnClass}" 
                             data-visit-id="${v.visitId}" 
-                            data-current-state="${v.state}"
+                            data-current-state="${currentState}"
+                            data-original-state="${currentState}"
                             onclick="App.toggleCheckIn(this)">${btnText}</button>`;
                 }).join('<br>');
 
@@ -631,7 +672,7 @@
                         </td>
                         <td>${checkinButtons}</td>
                         <td>
-                            <button class="check-in-btn note-btn" onclick="location.href='https://mcdonaldswimschool.pike13.com/people/${item.id}/notes'">Notes</button>
+                            <button class="check-in-btn note-btn" onclick="window.open('https://mcdonaldswimschool.pike13.com/people/${item.id}/notes', '_blank')">Notes</button>
                         </td>
                     </tr>
                 `;
@@ -671,14 +712,12 @@
             UI.render(); // Show loading UI immediately
 
             // Phase 1: Get Basic Schedule (Events, Notes, Opens)
-            Store.scheduleData = await API.getBasicEvents(Store.currentDate);
-            Store.isLoading = false;
-            UI.render(); // Render names/times immediately
+            let basicData = await API.getBasicEvents(Store.currentDate);
+            
+            // Phase 2: Fetch Report Data (Client details and correct names)
+            Store.scheduleData = await API.enrichWithReports(basicData);
 
-            // Phase 2: Fetch Report Data (Client details)
-            // This runs in background and updates UI when done
-            const enrichedData = await API.enrichWithReports(Store.scheduleData);
-            Store.scheduleData = enrichedData;
+            Store.isLoading = false;
             UI.render();
         },
 
@@ -696,40 +735,67 @@
         },
 
         toggleCheckIn(btn) {
-            const isCheckIn = btn.innerText === "Check In";
-            if (isCheckIn) {
-                btn.innerText = "No Show";
-                btn.classList.remove('status-registered');
-                btn.classList.add('status-noshow');
-                btn.dataset.type = "No Show"; 
-            } else if (btn.innerText === "No Show") {
+            // Only allow toggling if current state is registered, noshowed, or the button has been marked for submission
+            const isRegistered = btn.dataset.currentState === 'registered';
+            const isNoShowed = btn.dataset.currentState === 'noshowed';
+            const isMarkedNoShow = btn.dataset.type === "No Show";
+            const isMarkedCheckIn = btn.dataset.type === "Check In";
+
+            if (isRegistered || isMarkedNoShow) {
+                // If registered or currently marked No Show, switch to Check In
                 btn.innerText = "Check In";
                 btn.classList.remove('status-noshow');
                 btn.classList.add('status-registered');
                 btn.dataset.type = "Check In";
+            } else if (isNoShowed || isMarkedCheckIn) {
+                 // If noshowed or currently marked Check In, switch to No Show
+                btn.innerText = "No Show";
+                btn.classList.remove('status-registered');
+                btn.classList.add('status-noshow');
+                btn.dataset.type = "No Show";
             }
-            // Ignore if status is 'Completed'
+            // For 'completed', we don't allow toggling, as it's a final state.
         },
 
         async submitAttendance() {
-            const btns = [...document.querySelectorAll('.check-in-btn[data-type]')];
+            const btns = [...document.querySelectorAll('.check-in-btn[data-visit-id]')];
+            
+            // Filter only buttons that have been interacted with (data-type set)
             const updates = btns.filter(b => b.dataset.type).map(b => ({
                 visitId: b.dataset.visitId,
-                type: b.dataset.type
+                type: b.dataset.type, // "Check In" or "No Show"
+                currentState: b.dataset.currentState
             }));
+
             if (updates.length === 0) return;
-            UI.els.table.innerHTML = '<tr><td colspan="3" style="text-align:center">Submitting...</td></tr>';
-            const selectedDate = new Date(Store.currentDate);
+            
+            // Check for future date submission guard
+            const selectedDate = new Date(Store.currentDate + "T23:59:59");
             if (new Date() < selectedDate) {
-                // Use custom message box instead of alert()
-                console.error("Cannot submit attendance for future dates.");
-                App.loadData();
+                // Cannot use alert(), so log error and reset UI
+                console.error("Attendance cannot be submitted for future dates.");
+                UI.els.table.innerHTML = '<tr><td colspan="3" style="text-align:center; color: var(--red);">Error: Events must be in the past to submit attendance.</td></tr>';
+                setTimeout(() => App.loadData(), 3000);
                 return;
             }
-            await API.updateAttendance(updates);
-            setTimeout(() => App.loadData(), 500);
+
+            UI.els.table.innerHTML = '<tr><td colspan="3" style="text-align:center; padding: 20px;">Submitting... Please wait.</td></tr>';
+            
+            // Only update if the action is changing the state (e.g., registered -> complete, registered -> noshow, noshowed -> complete)
+            const changesToSubmit = updates.filter(u => {
+                 const newStatus = u.type === "Check In" ? "completed" : "noshowed";
+                 return u.currentState !== newStatus;
+            });
+            
+            if (changesToSubmit.length > 0) {
+                 await API.updateAttendance(changesToSubmit);
+            }
+
+            // Reload data after submission
+            setTimeout(() => App.loadData(), 1000);
         },
         
+        // Resets the temporary interaction state by reloading data
         resetView() { App.loadData(); },
 
         setupPullRefresh() {
