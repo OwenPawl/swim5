@@ -323,14 +323,16 @@
                     const clientId = Number(p.id);
                     const isInternal = CONFIG.ignoredClientIds.includes(clientId);
 
-                    // Use event name as a placeholder before report enrichment
+                    // Use event name as a placeholder before report enrichment. 
+                    // The crucial name fix happens in enrichWithReports.
                     rawList.push({
                         id: p.id,
                         visitId: p.visit_id,
                         state: p.visit_state,
                         start: evt.start_at,
                         end: evt.end_at,
-                        name: isInternal ? (evt.name || "Internal Slot") : p.name, 
+                        // If it's internal, set the type, the real name will come from the report.
+                        name: p.name, 
                         type: isInternal ? "internal_client" : "lesson", 
                         level: "", 
                         isNew: false,
@@ -367,7 +369,7 @@
 
       // STAGE 2: Fetch details for Clients and apply name fix
       async enrichWithReports(currentList) {
-         // Get unique client IDs (numeric and not already marked as internal/open)
+         // Get unique client IDs (numeric and not already marked as open)
          const clientIds = currentList
             .filter(x => x.id && !isNaN(x.id))
             .map(x => x.id);
@@ -409,14 +411,16 @@
                 if (item.type === 'open') return item;
                 
                 const details = rows.find(r => Number(r[0]) === Number(item.id));
+                
                 if (details) {
                     const clientId = Number(item.id);
                     const isInternal = CONFIG.ignoredClientIds.includes(clientId);
                     
-                    // The client's actual name is at index 1 in the new report structure
+                    // The client's actual name/title is at index 1 in the new report structure
                     const realName = details[1]; 
 
-                    // 1. ALWAYS use the real name
+                    // 1. ALWAYS use the real name from the report, which is the correct name 
+                    //    for both actual clients and internal slots (e.g., "Note Time").
                     item.name = realName || item.name;
                     item.type = isInternal ? "internal_client" : "lesson";
                     
@@ -431,6 +435,7 @@
                         const firstVisit = details[2];
                         const birthdate = details[3];
 
+                        // Attempt to extract level from string (e.g., 'Level X')
                         item.level = /\d/.test(levelStr[6]) ? levelStr[6] : (levelStr.split(" ")[0]?.[0] || "?");
                         item.isNew = !firstVisit; 
                         
@@ -454,6 +459,7 @@
         const headers = this.getHeaders();
         // Use a Promise.allSettled to handle all updates concurrently and robustly
         const results = await Promise.allSettled(updates.flatMap(u => {
+            // Must reset state first to allow re-applying attendance
             const reset = fetch(`${CONFIG.apiBase}/visits/${u.visitId}`, {
                 method: "PUT", headers, body: JSON.stringify({ visit: { state_event: "reset" } })
             });
@@ -774,8 +780,9 @@
             if (new Date() < selectedDate) {
                 // Cannot use alert(), so log error and reset UI
                 console.error("Attendance cannot be submitted for future dates.");
+                // Provide temporary feedback in the table
                 UI.els.table.innerHTML = '<tr><td colspan="3" style="text-align:center; color: var(--red);">Error: Events must be in the past to submit attendance.</td></tr>';
-                setTimeout(() => App.loadData(), 3000);
+                setTimeout(() => App.loadData(), 3000); // Reload data after 3 seconds
                 return;
             }
 
